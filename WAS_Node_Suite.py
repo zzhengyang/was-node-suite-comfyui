@@ -7313,12 +7313,20 @@ class WAS_Image_Save:
                 "show_previews": (["true", "false"],),
             },
             "hidden": {
-                "prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+                "save_oss": (["true", "false"],),
+                "access_key_id": ("STRING", {"default":""}),
+                "access_key_secret": ("STRING", {"default":""}),
+                "security_token": ("STRING", {"default":""}),
+                "endpoint": ("STRING", {"default":""}),
+                "bucket_name": ("STRING", {"default":""}),
+                "file_path": ("STRING", {"default":""}),
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "STRING",)
-    RETURN_NAMES = ("images", "files",)
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("images", "files", "oss_urls")
 
     FUNCTION = "was_save_images"
 
@@ -7330,7 +7338,8 @@ class WAS_Image_Save:
                         extension='png', dpi=96, quality=100, optimize_image="true", lossless_webp="false", prompt=None, extra_pnginfo=None,
                         overwrite_mode='false', filename_number_padding=4, filename_number_start='false',
                         show_history='false', show_history_by_prefix="true", embed_workflow="true",
-                        show_previews="true"):
+                        show_previews="true", save_oss="false", access_key_id='', access_key_secret='', security_token='',
+                        endpoint='', bucket_name='', file_path=''):
 
         delimiter = filename_delimiter
         number_padding = filename_number_padding
@@ -7445,7 +7454,7 @@ class WAS_Image_Save:
                              quality=quality, lossless=lossless_webp, exif=exif_data)
                 elif extension == 'png':
                     img.save(output_file,
-                             pnginfo=exif_data, optimize=optimize_image)
+                             pnginfo=exif_data, optimize=optimize_image, dpi=(dpi, dpi))
                 elif extension == 'bmp':
                     img.save(output_file)
                 elif extension == 'tiff':
@@ -7516,10 +7525,15 @@ class WAS_Image_Save:
                 }
                 results.append(image_data)
 
+        oss_urls = []
+        if save_oss == 'true':
+            oss_urls = [self.upload(output_file, extension, access_key_id, access_key_secret, security_token, endpoint, bucket_name, file_path) for output_file in output_files]
+            oss_urls = [url for url in oss_urls if url is not None]
+
         if show_previews == 'true':
-            return {"ui": {"images": results, "files": output_files}, "result": (images, output_files,)}
+            return {"ui": {"images": results, "files": output_files, "oss_urls": oss_urls}, "result": (images, output_files, oss_urls)}
         else:
-            return {"ui": {"images": []}, "result": (images, output_files,)}
+            return {"ui": {"images": [], "oss_urls": oss_urls}, "result": (images, output_files, oss_urls)}
 
     def get_subfolder_path(self, image_path, output_path):
         output_parts = output_path.strip(os.sep).split(os.sep)
@@ -7529,6 +7543,75 @@ class WAS_Image_Save:
         subfolder_path = os.sep.join(subfolder_parts[:-1])
         return subfolder_path
 
+
+    def upload(self, output_file, extension, access_key_id, access_key_secret, security_token, endpoint, bucket_name, file_path):
+        import oss2
+        import uuid
+        import requests
+        import time
+        import os
+
+        # 记录总体开始时间
+        start_time = time.time()
+
+        filename = str(uuid.uuid4()) + '.' + extension
+        
+        # 获取文件大小（用于分析）
+        file_size = os.path.getsize(output_file) / (1024 * 1024)  # 转换为MB
+        
+        # 如果非办公网环境，直接提交prompt时指定token，办公网环境可自动获取
+        if not access_key_id or not access_key_secret or not security_token or not endpoint or not bucket_name:
+            # 获取STS临时凭证
+            try:
+                # url = 'https://api-aigc.mayfair-inc.com/n/api/ai/vision/upload_token/get?filename=' + filename + '&auth=70fM2POj%23wq*3(1K#wq*3(1K'
+                url = 'http://127.0.0.1:8080/n/api/ai/vision/upload_token/get?filename=' + filename + '&auth=70fM2POj%23wq*3(1K#wq*3(1K'
+                response = requests.get(url, timeout=3)
+                sts_info = response.json()
+            except Exception as e:
+                print(f"上传文件获取token出错: {str(e)}")
+                return None
+            
+            # 检查STS信息是否有效
+            if sts_info.get('ret') != 200 or 'data' not in sts_info:
+                print(f"获取STS凭证失败: {sts_info}")
+                return None
+            
+            sts_data = sts_info['data']
+            
+            # 从STS响应中获取凭证
+            access_key_id = sts_data['accessKeyId']
+            access_key_secret = sts_data['accessKeySecret']
+            security_token = sts_data['securityToken']
+            bucket_name = sts_data['bucket']
+            endpoint = sts_data.get('endpoint', 'https://oss-cn-hangzhou.aliyuncs.com')
+            object_name = sts_data.get('filePath', '') + filename
+        else:
+            object_name = file_path + filename
+        
+        # 使用STS临时凭证配置访问
+        try:
+            auth = oss2.StsAuth(access_key_id, access_key_secret, security_token)
+        
+            # 初始化bucket
+            bucket = oss2.Bucket(auth, endpoint, bucket_name)
+        
+            result = bucket.put_object_from_file(object_name, output_file)
+            upload_status = result.status
+            upload_success = 200 <= upload_status < 300
+        except Exception as e:
+            print(f"上传文件时出错: {str(e)}")
+            upload_status = "Error"
+            upload_success = False
+        
+        total_time = time.time() - start_time
+        
+        # 生成URL
+        url = f"https://{bucket_name}.oss-cn-hangzhou.aliyuncs.com/{object_name}" if upload_success else None
+        
+        print(f"  文件大小: {file_size:.2f}MB, 上传速度: {file_size/total_time:.2f}MB/秒" if upload_success else "  上传失败")
+        print(f"  上传结果status: {upload_status}, url:{url}")
+        
+        return url
 
 # Image Send HTTP
 # Sends images over http
